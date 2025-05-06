@@ -1,0 +1,64 @@
+@startuml
+
+'skinparam linetype ortho
+skinparam TitleFontSize 30
+Title SAE J1772 EVSE Control Pilot State Machine
+
+state "Unplugged" as A #DDDDFF {  
+    state A1 #DDDDFF: 12V 
+    state A2 #DDDDFF: 12V PWM
+}
+state "Plugged-in" as B #FFFFCE {   
+    State B1 #FFFFCE: 9V
+    State B2 #FFFFCE: 9V PWM
+    State C1 #FFFFCE: 6V
+}
+state "Charging" as C #CCFFCC {    
+    State C2 #CCFFCC: 6V PWM
+}
+
+state "Disabled" as D #FFCCCC {    
+    State E #FFCCCC|white: 0V
+    State F #FFCCCC ##[dotted] : -12V
+}
+
+
+/' Unplug after EVSE Initiated Stop '/
+B1 -left-> A1 : Unplug [5]
+/' Normal Plug-in '/
+A1 -right-> B1 :Plug-in [1]
+
+/' Normal Unplug as EV initiated Stop '/
+B2 -left-> A2 : Unplug [5] 
+/' is A2 to B2 transition valid? '/
+A2 -right-> B2 : Plug-in [1]
+
+/' EV opening S2 after EVSE initiated Stop or BCB toggle (rare) '/
+C1 -left-> B1 : EV opens \npilot switch S2 [9]
+/' EV initiated BCB toggle (rare) '/
+B1 -right-> C1 : EV closes \npilot switch S2 [10]
+
+/' EV Initiated Stop '/
+C2 -left-> B2 : EV opens \npilot switch S2 [4]
+/' EV Initiated Start '/
+B2 -right-> C2 : EV closes \npilot switch S2 [3]
+
+/' EVSE Initiated Stop '/
+C2 -up-> C1 : Stop PWM [8]
+/' C1 to C2 transition could happen only after a C2 to C1 transition
+which the EV has 3 seconds to open S2 (C1 to B1 [2]), but during those 
+3 seconds the EVSE could turn the oscillator back on.  This is very rare '/
+C1 -down-> C2 : Start PWM [11]
+
+/' EVSE Commanded to not Start Charging '/
+B2 -up-> B1 : Stop PWM [7]
+/' EVSE Detects Plugin and is Ready to Charge '/
+B1 -down-> B2 : Start PWM [2]
+
+/' EVSE unplugged from PEV and Oscillator still on '/
+A2 -up-> A1 : Stop PWM [6]
+
+[*] -up-> E : Power Outage \nor Pilot Short \nto Ground 
+[*] -up-> F : EVSE Failure 
+
+@enduml

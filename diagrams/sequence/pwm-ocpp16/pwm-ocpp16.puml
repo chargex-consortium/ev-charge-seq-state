@@ -1,0 +1,145 @@
+@startuml
+
+/' Config Variables to match OCPP Style '/
+skin rose
+skinparam shadowing false
+hide footbox
+
+/'This sequence diagram shows the communication between the SAE J1772 EV (AC Charging Only), 
+the Charging Station (CS), and the OCPP 1.6J CSMS. The diagram shows the 
+analog communication between the EV and CS, the OCPP 1.6J communication between the CS and CSMS,
+the controlled charging messaging, loop charging, updating the charge profile, and the end of 
+charging and stopping the OCPP transaction.'/
+
+
+actor "EV driver" as EVD
+participant "SAE J1772 EV" as EV
+participant "EVSE" as CS
+participant "OCPP 1.6J CSMS" as CSMS
+participant "Secondary Actor (SA)" as SA
+
+group J1772 Initialization
+  
+    SA -> CSMS : Provide Available PmaxSchedule
+    EVD -> EV: Charging Cable Plugged In
+
+    EV -> CS: Control Pilot State A1 -> B1
+      
+    CS -> CSMS: StatusNotification.req(connectorId, errorCode, status=Preparing, [timestamp], [info], [vendorId], [vendorErrorCode])
+    activate CS
+    activate CSMS     
+    CSMS --> CS: StatusNotification.conf() 
+    deactivate CSMS    
+    deactivate CS
+          
+    EVD -> CS: present RFID(CHARGEX123)
+    CS -> CSMS: Authorize.req(idTag=CHARGEX123))
+    activate CS
+    activate CSMS
+    CSMS --> CS: Authorize.conf(status = Accepted)
+    deactivate CS
+    deactivate CSMS   
+    opt
+    CS -> EVD: Notification
+    end  
+    deactivate EV
+    deactivate CS
+
+    note over EV, CS: EVSE turns on Control Pilot Oscillator with Default Duty Cycle
+    CS -> EV: Control Pilot State A1 -> B2
+
+    note over EV, CS: EV Detects EVSE is Ready and Closes Pilot Switch S2 to Initiate Charging
+    EV -> CS: Control Pilot State B2 -> C2    
+    CS -> CS: Contactor Closed
+
+    CS -> CSMS: StartTransaction.req(connectorId, idTag, meterStart, timestamp)
+    activate CSMS
+    activate CS
+    CSMS --> CS: StartTransaction.conf(idTaginfo, transactionId)
+    deactivate CSMS
+    deactivate CS
+    
+    CSMS -> CS : SetChargingProfile.req(ConnectorId, csChargingProfiles)    
+    activate CSMS
+    activate CS
+    CS --> CSMS : SetChargingProfileResponse(Accepted)  
+    deactivate CSMS
+    deactivate CS
+    
+    note over EV, CS: EVSE Changes Control Pilot Duty Cycle to Adhere to Charging Profile     
+    
+     CS -> CSMS: StatusNotification.req(connectorId, errorCode, status=Charging, [timestamp], [info], [vendorId], [vendorErrorCode])
+    activate CS
+    activate CSMS     
+    CSMS --> CS: StatusNotification.conf() 
+    deactivate CSMS    
+    deactivate CS
+
+    CSMS --> SA: Update Aggregated EV Charging Schedule
+    
+end
+
+group Loop Charging
+           
+    note over EV, CS: EVSE Periodically Changes Control Pilot Duty Cycle to Adhere to Charging Profile  
+    
+    
+    CS -> CSMS: MeterValueRequest(MeterValue)
+    activate CS
+    activate CSMS
+    CSMS --> CS: MeterValueResponse(...)
+    deactivate CS
+    deactivate CSMS    
+end
+
+group Change Charge Profile (Initiated by CSMS)    
+    
+    SA -> CSMS: Update Available PmaxSchedule        
+    CSMS -> CS: SetChargingProfile.req(ConnectorId, csChargingProfile)
+    activate CS
+    activate CSMS
+    CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+    deactivate CSMS
+    deactivate CS      
+    
+    note over EV, CS: EVSE Changes Control Pilot Duty Cycle to Adhere to Charging Profile     
+
+    CSMS --> SA: Update Aggregated EV Charging Schedule
+
+    group Optional if chargingState changes based on new schedule
+        CS -> CSMS: StatusNotification.req(connectorId, errorCode, status, [timestamp], [info], [vendorId], [vendorErrorCode])
+    activate CS
+    activate CSMS     
+    CSMS --> CS: StatusNotification.conf() 
+    deactivate CSMS    
+    deactivate CS
+    end     
+end
+
+group End Charging and Stop OCPP Transaction
+    EV -> CS : Control Pilot C2 -> B2
+    CS -> CS: Contactor Opened 
+
+    CS -> CSMS: StatusNotification.req(connectorId, errorCode, status=SuspendedEV, [timestamp], [info], [vendorId], [vendorErrorCode])
+    activate CS
+    activate CSMS     
+    CSMS --> CS: StatusNotification.conf() 
+    deactivate CSMS    
+    deactivate CS
+    EVD -> EV: Charging Cable Unplugged from EV
+    EV -> CS: Control Pilot State B2 -> A2
+    CS -> CS: Control Pilot State A2 -> A1
+    CSMS -> CS: StopTransaction.req(connectorId, idTag, meterStart, timestamp)  
+    activate CS
+    activate CSMS  
+    CS --> CSMS: StopTransaction.conf([idTaginfo])
+    deactivate CSMS    
+    deactivate CS
+    CS -> CSMS: StatusNotification.req(transactionid, meterStop, timestamp, [idTag], [reason], [transactionData] )
+    activate CS
+    activate CSMS     
+    CSMS --> CS: StatusNotification.conf() 
+    deactivate CSMS    
+    deactivate CS
+end 
+@enduml

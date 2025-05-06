@@ -1,0 +1,298 @@
+@startuml
+
+/' Config Variables to match OCPP Style '/
+skin rose
+skinparam shadowing false
+hide footbox
+
+/' This sequence diagram shows the communication between the ISO 15118-2 EV, 
+the Charging Station (CS), and the OCPP 2.0.1 CSMS. The diagram shows the 
+communication setup, the OCPP transaction started, the charge scheduling, 
+the loop charging, the renegotiation, and the end of charging and stopping 
+the OCPP transaction. '/
+
+/' Based on Schema: urn:iso:15118:2:2013:MsgDef v2.0 '/
+
+actor "EV driver" as EVD
+participant "ISO 15118-2 EV" as EV
+participant "EVSE" as CS
+participant "OCPP 2.0.1 CSMS" as CSMS
+participant "Secondary Actor (SA)" as SA
+
+group ISO 15118 Initialization, Authentication, Authorization
+    SA -> CSMS : Provide Available PmaxSchedule or Tariff Table
+    EVD -> EV: Charging Cable Plugged In
+    activate CS
+    CS -> CSMS: StatusNotificationRequest(Occupied)
+    activate CSMS     
+    CSMS --> CS: StatusNotificationResponse()
+    deactivate CSMS 
+    CS -> CSMS: TransactionEventRequest(eventType = Started, chargingState = EVConnected, triggerReason = CablePluggedIn)
+    activate CSMS    
+    CSMS --> CS: TransactionEventResponse(status = Accepted)
+    deactivate CSMS
+    deactivate CS
+
+    EV -> CS: SupportedAppProtocolReq()
+    activate CS
+    CS --> EV: SupportedAppProtocolRes()
+    deactivate CS
+    EV -> CS: SessionSetupReq()
+    activate CS
+    CS --> EV: SessionSetupRes()
+    deactivate CS  
+    EV -> CS: ServiceDiscoveryReq()
+    activate CS
+    CS --> EV: ServiceDiscoveryRes()
+    deactivate CS
+    EV -> CS: PaymentServiceSelectionReq()
+    activate CS
+    CS --> EV: PaymentServiceSelectionRes()
+    deactivate CS
+
+    EV -> CS: AuthorizationReq()
+    activate EV
+    activate CS      
+    loop Until AuthorizeResponse is received from CSMS
+        CS --> EV: AuthorizationRes(EVSEProcessing=Ongoing)    
+        deactivate CS
+        EV -> CS: AuthorizationReq()
+        activate CS
+    end
+    EVD -> CS: present RFID(CHARGEX123)
+    CS -> CSMS: AuthorizeRequest(idToken(id = CHARGEX123, type = ISO14443))
+    activate CSMS
+    CSMS --> CS: AuthorizeResponse(status = Accepted)
+    deactivate CSMS
+    CS --> EV: AuthorizationRes(EVSEProcessing=Finished, ResponseCode = Accepted)
+    opt
+    CS -> EVD: Notification
+    end  
+    deactivate EV
+    deactivate CS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = EVConnected, triggerReason = Authorized)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse(status = Accepted)
+    deactivate CS
+    deactivate CSMS
+end
+
+group Charge Scheduling
+    EV -> CS: ChargeParameterDiscoveryReq(EnergyTransferMode, EVChargeParam: DepartureTime, EAmount ...)
+    activate EV
+    activate CS
+    CS -> CSMS: NotifyEVChargingNeedsRequest(evseId, chargingNeeds)
+    activate CSMS
+    CSMS --> CS: NotifyEVChargingNeedsResponse(status = Accepted)
+    deactivate CSMS
+
+    ' Optimization Algorithm
+    CSMS -> CSMS: Optimization Algorithm
+
+    loop Until SetChargingProfileRequest is received from CSMS
+        CS --> EV: ChargeParameterDiscoveryRes(Ongoing)    
+        deactivate CS
+        EV -> CS: ChargeParameterDiscoveryReq(EnergyTransferMode, EVChargeParam: DepartureTime, EAmount ...)
+        activate CS
+    end
+
+    opt if Tariff Tables are provided
+    CSMS -> CS: DataTransferRequest(vendorId, [messageId], [TariffTable])
+    activate CSMS
+    CS --> CSMS: DataTransferResponse(status = Accepted)
+    deactivate CSMS
+    end
+
+    CSMS -> CS: SetChargingProfileRequest(evseId, chargingProfile)
+    activate CSMS
+    CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+    deactivate CSMS 
+
+    CS --> EV: ChargeParameterDiscoveryRes(Finished, EVSEChargeParameter, SAScheduleList:SAScheduleTuple, PmaxSchedule)
+    deactivate CS
+    deactivate EV
+    EV -> CS: PowerDeliveryReq(ChargingProfile: ProfileEntryList, ChargeProgress = Start)
+    activate CS
+    CS -> CS: Contactor Closed
+    CS --> EV: PowerDeliveryRes(status = Ok)
+    deactivate CS
+    deactivate CSMS
+
+    CS -> CSMS: NotifyEVChargingScheduleRequest(evseId, chargingSchedule)
+    activate CS
+    activate CSMS
+    CSMS --> CS: NotifyEVChargingScheduleResponse(status = Accepted)
+    deactivate CS
+    deactivate CSMS
+
+    CSMS --> SA: Update Aggregated EV Charging Schedule
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = Charging, triggerReason = ChargingStateChanged)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse(status = Accepted)
+    deactivate CS
+    deactivate CSMS
+end
+
+group Loop Charging
+    group AC Charging        
+        EV -> CS: ChargingStatusReq()
+        activate CS
+        activate EV
+        CS --> EV: ChargingStatusRes()
+        deactivate CS
+        deactivate EV   
+    end
+
+    CS -> CSMS: MeterValueRequest(MeterValue)
+    activate CS
+    activate CSMS
+    CSMS --> CS: MeterValueResponse(status = Accepted)
+    deactivate CS
+    deactivate CSMS
+
+    group DC Charging        
+        EV -> CS: CurrentDemandReq()
+        activate CS
+        activate EV
+        CS --> EV: CurrentDemandRes()
+        deactivate CS
+        deactivate EV
+    end
+end
+
+group Renegotiation (Initiated by CSMS or EV)
+    ' K16 - Renegotiation initiated by CSMS
+    group Initiated by CSMS 
+        SA -> CSMS: Update Available PmaxSchedule or Tariff Table
+        ' Optimization Algorithm
+        CSMS -> CSMS: Optimization Algorithm
+        CSMS -> CS: SetChargingProfileRequest(evseId, chargingProfile)
+        activate CS
+        activate CSMS
+        CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+        deactivate CSMS
+        deactivate CS
+
+        group AC Charging        
+            EV -> CS: ChargingStatusReq()
+            activate CS
+            activate EV
+            CS --> EV: ChargingStatusRes(EVSENotification = ReNegotiation)
+            deactivate CS
+            deactivate EV
+        end
+
+        group DC Charging        
+            EV -> CS: CurrentDemandReq()
+            activate CS
+            activate EV
+            CS --> EV: CurrentDemandRes(EVSENotification = ReNegotiation)
+            deactivate CS
+            deactivate EV
+        end
+    end
+    ' K17 - Renegotiation initiated by EV
+    group Initiated by EV
+        EV -> CS: PowerDeliveryReq(chargeProcess = Renegotiate)
+        activate CS
+        CS --> EV: PowerDeliveryRes(status = Ok)
+        deactivate CS
+    end
+
+    group Renegotiation after Initiation
+        EV -> CS: ChargeParameterDiscoveryReq(EnergyTransferMode, EVChargeParam: DepartureTime, EAmount ...)
+        activate EV
+        activate CS
+        CS -> CSMS: NotifyEVChargingNeedsRequest(evseId, chargingNeeds)
+        activate CSMS
+        CSMS --> CS: NotifyEVChargingNeedsResponse(status = Accepted)
+        deactivate CSMS
+
+        ' Optimization Algorithm
+        CSMS -> CSMS: Optimization Algorithm
+
+        loop Until SetChargingProfileRequest is received from CSMS
+            CS --> EV: ChargeParameterDiscoveryRes(EVSEProcessing=Ongoing)    
+            deactivate CS
+            EV -> CS: ChargeParameterDiscoveryReq(EnergyTransferMode, EVChargeParam: DepartureTime, EAmount ...)
+            activate CS
+        end
+
+        opt if Tariff Tables are in use
+        CSMS -> CS: DataTransferRequest(vendorId, [messageId], [TariffTable])
+        activate CSMS
+        CS --> CSMS: DataTransferResponse(status = Accepted)
+        deactivate CSMS
+        end
+
+        CSMS -> CS: SetChargingProfileRequest(evseId, chargingProfile)
+        activate CSMS
+        CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+        deactivate CSMS        
+
+        CS --> EV: ChargeParameterDiscoveryRes(EVSEProcessing=Finished, EVSEChargeParameter, SAScheduleList:SAScheduleTuple, PmaxSchedule)
+        deactivate CS
+        deactivate EV
+        EV -> CS: PowerDeliveryReq(ChargingProfile: ProfileEntryList, ChargeProgress = Start)
+        activate CS
+        CS -> CS: Contactor Remains Closed or Opens based on Renegotiation
+        CS --> EV: PowerDeliveryRes(status = Ok)
+        deactivate CS
+        deactivate CSMS
+
+        CS -> CSMS: NotifyEVChargingScheduleRequest(evseId, chargingSchedule)
+        activate CS
+        activate CSMS
+        CSMS --> CS: NotifyEVChargingScheduleResponse(status = Accepted)
+        deactivate CS
+        deactivate CSMS
+
+        CSMS --> SA: Update Aggregated EV Charging Schedule
+
+        group Optional if chargingState changes based on new schedule
+            CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = SuspendedEVSE, triggerReason = ChargingStateChanged)
+            activate CS
+            activate CSMS
+            CSMS --> CS: TransactionEventResponse(status = Accepted)
+            deactivate CS
+            deactivate CSMS
+        end
+    end
+end
+
+group End Charging and Stop OCPP Transaction
+    EV -> CS: PowerDeliveryReq(chargeProcess = Stop)    
+    activate CS
+    CS -> CS: Contactor Opened
+    CS --> EV: PowerDeliveryRes(status = Ok)
+    deactivate CS   
+    EV -> CS: SessionStopReq()
+    activate CS
+    CS --> EV: SessionStopRes(status = Ok)
+    deactivate CS
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = EVConnected, triggerReason = ChargingStateChanged)
+    activate CSMS
+    activate CS
+    CSMS --> CS: TransactionEventResponse(status = Accepted)
+    deactivate CSMS
+    deactivate CS
+    EVD -> EV: Charging Cable Unplugged from EV
+    CS -> CSMS: StatusNotificationRequest(Available)
+    activate CSMS
+    activate CS
+    CSMS --> CS: StatusNotificationResponse(status = Accepted)
+    deactivate CSMS 
+    deactivate CS
+    CS -> CSMS: TransactionEventRequest(eventType = Ended, chargingState = Idle, triggerReason = EVCommunicationLost)
+    activate CSMS
+    activate CS
+    CSMS --> CS: TransactionEventResponse(status = Accepted)
+    deactivate CSMS
+    deactivate CS
+end
+
+@enduml

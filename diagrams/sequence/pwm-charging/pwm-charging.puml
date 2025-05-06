@@ -1,0 +1,214 @@
+@startuml
+
+skinparam TitleFontSize 30
+Title SAE J1772 Controlled Charging via PWM Modulation Sequence Diagram
+header: JOET ChargeX Consortium
+caption Time (t)
+/'footer: some footer'/
+
+robust "EVSE Control Pilot (CP) \nVoltage (V)" as V
+concise "EVSE Control Pilot State" as CP
+concise "EVSE State" as ES
+robust "PEV Control Pilot (CP) \nVoltage (V)" as PV
+concise "PEV Control Pilot State" as PCP
+concise "PEV Proximity State" as PP
+concise "PEV State" as PS
+robust "PEV Proximity \nVoltage (V)" as PPV
+robust  "Ampacity Limit (A)"  as AL
+robust "EVSE CP Duty Cycle (%)" as DC
+robust "EVSE Contactor" as EC
+analog  "Charging Current (A)" between 0 and 30 as CC
+CC ticks num on multiple 5 
+
+
+V has "12V" as high
+V has "9V" as mid
+V has "6V" as low
+V has "0V" as none
+
+PV has "12V" as high
+PV has "9V" as mid
+PV has "6V" as low
+PV has "0V" as none
+
+/' 4.46V, 1.53, 2.77, disconnected, Connected S3 Released, Connected S3 Depressed '/
+PPV has "4.46V" as high
+PPV has "2.77V" as mid
+PPV has "1.53V" as low
+PPV has "0V" as none
+
+AL has 30,20,6,0
+DC has 100,50,33,10
+
+@0
+V is 12V
+PV is 0V
+CP is A1 
+PCP is E
+PP is Disconnected
+PPV is 4.46V
+PS is Awake
+AL is 0
+DC is 100
+EC is Opened
+CC is 0
+ES is "Not Ready"
+
+@3
+V is 9V
+PV is 9V
+PPV is 2.77V
+CP is B1
+PCP is B1
+PP is ""
+
+@3.25
+PPV -> PP@3.25 : Connected S3 Depressed
+
+@3.5
+PPV is 1.53V
+PP is "Connected S3 Released"
+
+@4
+V is 9V
+PV is 9V
+PPV is 1.53V
+CP is B2
+PCP is B2
+DC is 50
+AL is 30
+ES is "Ready"
+
+@5.9
+V is 6V
+PV is 6V
+CP is C2
+PCP is C2
+
+@6
+V is 6V
+PV is 6V
+EC is Closed
+CC is 0
+
+@6.5
+CC is 30
+
+@12
+AL is 20
+DC is 33
+CC is 30
+DC -> CC@12.2 : Curtail to 20 A
+
+@12.2 
+CC is 20
+
+@15
+AL is 6
+DC is 10
+CC is 20
+DC -> CC@15.2 : Curtail to 6 A
+
+@15.2
+CC is 6
+
+@18
+/'EVSE Initiated Stop'/
+CP is C1  
+PCP is C1 
+DC is 100
+AL is 0
+ES is "Not Ready"
+CC is 6
+/'note top of CP : EVSE Initiated Stop\nShut Off CP Oscillator'/
+DC -> CC@18.5 : Stop Charging
+CP -> AL@18 : EVSE Initiated Stop
+
+@18.5
+EC is Opened
+CC is 0
+V is 9V
+PV is 9V
+CP is B1
+PCP is B1
+
+@24
+PS is Asleep
+PPV is 0V
+
+@28
+/'Pilot Wake'/
+PS is Awake
+V is 9V
+PV is 9V
+PPV is 1.53V
+CP is B2
+PCP is B2
+DC is 50
+AL is 30
+ES is "Ready"
+CP -> PPV@28.2 : Pilot Wake
+
+@29.9
+V is 6V
+PV is 6V
+CP is C2
+PCP is C2
+
+@30
+V is 6V
+PV is 6V
+EC is Closed
+CC is 0
+
+@30.5
+CC is 30
+
+@35
+/'PEV Initiated Stop'/
+CP is B2
+PCP is B2
+V is 9V
+PV is 9V
+CC is 30
+PCP -> EC@35.2 : PEV Initiated Stop
+
+@35.2
+EC is Opened
+CC is 0
+EC -> CC@35.2 : Stop Charging
+
+@40
+PPV is 2.77V
+PP is ""
+
+@40.25
+PPV -> PP@40.25 : Connected S3 Depressed
+
+@40.5
+V is 12V
+PV is 0V
+CP is A2
+PCP is E
+DC is 100
+AL is 0
+PPV is 4.46V
+PP is Disconnected
+
+@41.5
+CP is A1
+ES is "Not Ready"
+
+@43
+
+highlight 0 to 3 #DDDDFF;line:Black : <font size=18>**Available**</font>
+highlight 3 to 6 #FFFFCE;line:Black : <font size=18>**Preparing**</font>
+highlight 6 to 18.5 #CCFFCC;line:Black : <font size=18>**Charging**</font>
+highlight 18.5 to 28 #B7DDE8;line:Black : <font size=18>**EVSE Suspended**</font>
+highlight 28 to 30 #FFFFCE;line:Black : <font size=18>**Preparing**</font>
+highlight 30 to 35 #CCFFCC;line:Black : <font size=18>**Charging**</font>
+highlight 35 to 40.5 #FFD18C;line:Black : <font size=18>**EV Suspended**</font>
+highlight 40.5 to 44 #DDDDFF;line:Black : <font size=18>**Available**</font>
+
+@enduml
+
