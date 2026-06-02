@@ -1,6 +1,6 @@
 # Contributing to EVChargeSeqState
 
-First off, thank you for your interest in improving and expanding this repository! We welcome contributions of all kinds—from typo fixes and documentation improvements to new diagrams and template enhancements.
+First off, thank you for your interest in improving and expanding this repository! We welcome contributions of all kinds-from typo fixes and documentation improvements to new diagrams and template enhancements.
 
 ## 📋 How to Report Issues
 

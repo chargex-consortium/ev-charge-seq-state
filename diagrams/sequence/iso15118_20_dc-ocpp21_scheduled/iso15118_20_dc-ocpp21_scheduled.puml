@@ -1,0 +1,362 @@
+@startuml
+
+/' Config Variables to match OCPP Style '/
+skin rose
+skinparam shadowing false
+hide footbox
+
+/' Enable Teoz renderer for complex nesting '/
+!pragma teoz true
+
+/' ISO 15118-20 DC + OCPP 2.1 (Scheduled Control Mode) '/
+/' Complete DC charging session: session setup, service discovery, PnC auth, '/
+/' charge parameter discovery, schedule exchange, DC safety phases (CableCheck, PreCharge), '/
+/' power delivery, charge loop (250ms), welding detection, session termination '/
+
+actor "EV driver" as EVD
+participant "ISO 15118-20 EV (EVCC)" as EV
+participant "EVSE (SECC)" as CS
+participant "OCPP 2.1 CSMS" as CSMS
+participant "Secondary Actor (SA)" as SA
+
+/' Explicit participant ordering ensures consistent left-to-right layout '/
+
+group ISO 15118-20 Initialization, Authentication, Authorization
+    note over CS, CSMS: All TransactionEventRequest messages carry mandatory\nseqNo, timestamp, and transactionInfo(transactionId)\nper OCPP 2.1 (TransactionEventRequest.json required fields).\nThese envelope fields are omitted here for clarity except\nwhere transactionId is contextually relevant, e.g., the\nperiodic meter value events in the charge loop.
+    SA -> CSMS: Provide Available PmaxSchedule or Tariff Table
+    EVD -> EV: Charging Cable Plugged In
+    activate CS
+    CS -> CSMS: StatusNotificationRequest(connectorStatus: Occupied)
+    activate CSMS
+    CSMS --> CS: StatusNotificationResponse()
+    deactivate CSMS
+    CS -> CSMS: TransactionEventRequest(eventType = Started, chargingState = EVConnected, triggerReason = CablePluggedIn)
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CSMS
+    deactivate CS
+
+    /' Protocol negotiation and session setup '/
+    EV -> CS: SupportedAppProtocolReq()
+    activate CS
+    CS --> EV: SupportedAppProtocolRes()
+    deactivate CS
+
+    EV -> CS: SessionSetupReq()
+    activate CS
+    CS --> EV: SessionSetupRes()
+    deactivate CS
+
+    /' PnC certificate-based authentication inline '/
+    EV -> CS: AuthorizationSetupReq()
+    activate CS
+    CS --> EV: AuthorizationSetupRes(AuthorizationServices: [PnC],\nCertificateInstallationService: false,\nPnC_ASResAuthorizationMode(GenChallenge, SupportedProviders[ProviderID*]))
+    deactivate CS
+
+    EV -> CS: AuthorizationReq(SelectedAuthorizationService: PnC,\nPnC_AReqAuthorizationMode(GenChallenge, ContractCertificateChain) [signed])
+    activate EV
+    activate CS
+    loop Until AuthorizeResponse received from CSMS (max 60s (V2G_EVCC_Ongoing_Timeout))
+        CS --> EV: AuthorizationRes(EVSEProcessing=Ongoing)
+        deactivate CS
+        EV -> CS: AuthorizationReq()
+        activate CS
+    end
+
+    note over CS: Extract eMAID from\nContractCertificate subject field
+    CS -> CSMS: AuthorizeRequest(idToken(type = eMAID), iso15118CertificateHashData)
+    activate CSMS
+    note over CSMS: Validate certificate chain via PKI\nOCSP revocation check: 5-60s latency
+    CSMS --> CS: AuthorizeResponse(idTokenInfo(status = Accepted),\nallowedEnergyTransfer: [DC])
+    deactivate CSMS
+
+    CS --> EV: AuthorizationRes(EVSEProcessing=Finished, ResponseCode = OK)
+    deactivate CS
+    deactivate EV
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = EVConnected, triggerReason = Authorized)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+end
+
+group Service Discovery and Selection
+    /' DC service selection '/
+    EV -> CS: ServiceDiscoveryReq()
+    activate CS
+    CS --> EV: ServiceDiscoveryRes(ServiceRenegotiationSupported: true,\nEnergyTransferServiceList: [DC, DC_BPT])
+    deactivate CS
+
+    EV -> CS: ServiceDetailReq(serviceID: DC)
+    activate CS
+    CS --> EV: ServiceDetailRes(serviceID: DC,\nserviceParameterList(ParameterSet(ParameterSetID: 1,\nConnector: Extended, ControlMode: Scheduled,\nMobilityNeedsMode: EVCC, Pricing: AbsolutePricing)))
+    note right: ServiceDetailRes parameters per ISO 15118-20\nTable 207 [V2G20-1357]: Connector, ControlMode,\nMobilityNeedsMode, Pricing.\n(BPTChannel/GeneratorMode are BPT-only.)\nMobilityNeedsMode = SECC-allowed is forbidden\nin Scheduled mode per [V2G20-2666].
+    deactivate CS
+
+    EV -> CS: ServiceSelectionReq(SelectedEnergyTransferService(\nServiceID: DC, ParameterSetID: 1), SelectedVASList[opt])
+    activate CS
+    CS --> EV: ServiceSelectionRes()
+    deactivate CS
+end
+
+group Charge Scheduling (Scheduled Mode)
+    /' Default tariff config is independent of the per-transaction K18 flow; '/
+    /' shown here for placement, may occur at any prior time '/
+    opt Default tariff configured for EVSE (independent station-level config)
+        CSMS -> CS: SetDefaultTariffRequest(evseId, tariff)
+        activate CSMS
+        CS --> CSMS: SetDefaultTariffResponse(status = Accepted)
+        deactivate CSMS
+    end
+
+    /' Per OCPP 2.1 K18 (Figure 142): CPD is a single round-trip between EV and EVSE '/
+    /' with no CSMS involvement and no EVSEProcessing=Ongoing loop. '/
+    EV -> CS: DC_ChargeParameterDiscoveryReq(EVMaximumChargePower, EVMinimumChargePower,\nEVMaximumChargeCurrent, EVMinimumChargeCurrent,\nEVMaximumVoltage, EVMinimumVoltage)
+    activate CS
+    CS --> EV: DC_ChargeParameterDiscoveryRes(EVSEMaximumChargePower, EVSEMinimumChargePower,\nEVSEMaximumChargeCurrent, EVSEMinimumChargeCurrent,\nEVSEMaximumVoltage, EVSEMinimumVoltage)
+    deactivate CS
+
+    /' ScheduleExchangeReq carries departureTime + EVTargetEnergyRequest, '/
+    /' which is what the SECC forwards to CSMS in NotifyEVChargingNeedsRequest. '/
+    EV -> CS: ScheduleExchangeReq(MaximumSupportingPoints,\nScheduled_SEReqControlMode(DepartureTime, EVTargetEnergyRequest))
+    activate EV
+    activate CS
+
+    CS -> CSMS: NotifyEVChargingNeedsRequest(evseId,\nchargingNeeds(requestedEnergyTransfer: DC, controlMode: ScheduledControl,\nmobilityNeedsMode: EVCC,\nv2xChargingParameters(maxChargePower, minChargePower,\nmaxChargeCurrent, minChargeCurrent, maxVoltage, minVoltage,\nevTargetEnergyRequest),\ndepartureTime), maxScheduleTuples: 3)
+    note right: Per OCPP 2.1 [K18.FR.06]: ISO 15118-20 sessions populate\nv2xChargingParameters (V2XChargingParametersType), NOT\ndcChargingParameters (which is reserved for ISO 15118-2).\nDischarge fields of V2XChargingParametersType are omitted\nin unidirectional DC.
+    activate CSMS
+    CSMS --> CS: NotifyEVChargingNeedsResponse(status = Accepted)
+    deactivate CSMS
+
+    note over CSMS: Optimization algorithm:\n- Tariff tables from SA\n- Grid constraints\n- EV departure time\n- Current load across all EVSEs
+
+    loop Until EVSEProcessing = Finished (SECC awaits CSMS profile internally)
+        CS --> EV: ScheduleExchangeRes(EVSEProcessing=Ongoing)
+        deactivate CS
+        EV -> CS: ScheduleExchangeReq()
+        activate CS
+    end
+
+    CSMS -> CS: SetChargingProfileRequest(evseId,\nchargingProfile(id, stackLevel, chargingProfilePurpose: TxProfile,\ntransactionId, chargingProfileKind: Absolute, chargingSchedule[]))
+    note right: Per OCPP 2.1 [K18.FR.07]: SetChargingProfileRequest with\nchargingProfilePurpose=TxProfile requires transactionId\nto bind the profile to the active transaction.
+    activate CSMS
+    CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+    deactivate CSMS
+
+    CS --> EV: ScheduleExchangeRes(EVSEProcessing=Finished,\nScheduled_SEResControlMode(ScheduleTuple[](\nChargingSchedule(PowerSchedule,\nPriceLevelSchedule(NumberOfPriceLevels, PriceLevelScheduleEntries))\n)))
+    note right: PriceLevelSchedule uses abstract levels (0=cheapest).\nAlternative: AbsolutePriceSchedule for exact currency prices.\nEV displays tariff to driver before accepting session.
+    deactivate CS
+    deactivate EV
+end
+
+group DC Safety Phases
+    /' Cable check '/
+    EV -> CS: DC_CableCheckReq()
+    activate EV
+    activate CS
+    note right: V2G_EVCC_DC_CableCheck_Timeout = 40s\n(some implementations extend for legacy equipment compatibility)
+    loop Until EVSEProcessing = Finished (insulation test)
+        CS --> EV: DC_CableCheckRes(EVSEProcessing=Ongoing)
+        deactivate CS
+        EV -> CS: DC_CableCheckReq()
+        activate CS
+    end
+    CS --> EV: DC_CableCheckRes(EVSEProcessing=Finished)
+    deactivate CS
+    deactivate EV
+
+    /' Pre-charge voltage matching '/
+    EV -> CS: DC_PreChargeReq(EVProcessing, EVPresentVoltage, EVTargetVoltage)
+    activate EV
+    activate CS
+    note right: V2G_EVCC_DC_PreCharge_Timeout = 10s\n(some implementations extend for high-power voltage ramp-up)
+    loop Until EVProcessing = Finished (voltage matching)
+        CS --> EV: DC_PreChargeRes(EVSEPresentVoltage)
+        deactivate CS
+        EV -> CS: DC_PreChargeReq(EVProcessing, EVPresentVoltage, EVTargetVoltage)
+        activate CS
+    end
+    CS --> EV: DC_PreChargeRes(EVSEPresentVoltage)
+    deactivate CS
+    deactivate EV
+    note over EV, CS: EVSE adjusts output voltage to match EV battery voltage\nbefore contactor closure
+end
+
+group Loop Charging
+    EV -> CS: PowerDeliveryReq(EVProcessing: Finished,\nChargeProgress: Start,\nEVPowerProfile(Scheduled_EVPPTControlMode(SelectedScheduleTupleID),\nEVPowerProfileEntries))
+    note right: Per [V2G20-1546]: in Scheduled Control Mode the EVCC SHALL\nsend BOTH EVPowerProfile and ScheduleTupleID when ChargeProgress\nis Start, Standby, Stop, or Pause. ScheduleTupleID is carried inside\nScheduled_EVPPTControlMode.SelectedScheduleTupleID.
+    activate CS
+    CS -> CS: Contactor Closed
+    CS --> EV: PowerDeliveryRes()
+    deactivate CS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = Charging, triggerReason = ChargingStateChanged)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+
+    CS -> CSMS: NotifyEVChargingScheduleRequest(evseId, chargingSchedule, timeBase, selectedChargingScheduleId)
+    activate CS
+    activate CSMS
+    CSMS --> CS: NotifyEVChargingScheduleResponse(status = Accepted)
+    deactivate CS
+    deactivate CSMS
+
+    CSMS --> SA: Update Aggregated EV Charging Schedule
+
+    loop Every 250ms during charging
+        EV -> CS: DC_ChargeLoopReq(DisplayParameters(PresentSOC), MeterInfoRequested: false,\nEVPresentVoltage, Scheduled_DC_CLReqControlMode(EVTargetCurrent))
+        activate EV
+        activate CS
+        note right: Per ISO 15118-20 [V2G20-2183]:\nthe EVCC SHALL provide either EVTargetVoltage\nOR EVTargetCurrent in DC_ChargeLoopReq;\nNEVER both in the same message.\n(All Scheduled_DC_CLReqControlMode fields\nare optional per Table 174.)\nMeterInfoRequested is a mandatory boolean\nat the DC_ChargeLoopReq top level.\nNote: V2G_CI_DC.xsd declares both EVTargetCurrent\nand EVTargetVoltage as mandatory (no minOccurs="0").\nThe normative requirement [V2G20-2183] overrides\nthe schema; in practice the unused field is sent\nas a sentinel value.
+        CS --> EV: DC_ChargeLoopRes(EVSEPresentCurrent, EVSEPresentVoltage,\nEVSEPowerLimitAchieved, EVSECurrentLimitAchieved, EVSEVoltageLimitAchieved,\nScheduled_DC_CLResControlMode())
+        deactivate CS
+        deactivate EV
+    end
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, triggerReason = MeterValuePeriodic, transactionInfo(transactionId), meterValue[])
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+end
+
+group Schedule Renegotiation (Initiated by CSMS or EV)
+    note over EV, CSMS: ISO 15118-20 renegotiation uses parallel side stream\n(ScheduleRenegotiationPayloadID); charge loop continues\nuninterrupted on main stream [V2G20-1045]
+
+    /' K16: Renegotiation initiated by CSMS '/
+    group Initiated by CSMS (OCPP K16)
+        SA -> CSMS: Update Available PmaxSchedule or Tariff Table
+        CSMS -> CS: SetChargingProfileRequest(evseId,\nchargingProfile(id, stackLevel, chargingProfilePurpose: TxProfile,\ntransactionId, chargingProfileKind: Absolute, chargingSchedule[]))
+        activate CS
+        activate CSMS
+        CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+        note right: Per [K16.FR.01]: Charging Station SHALL respond\nwith SetChargingProfileResponse(status = Accepted).\nNote: in K16 the profile is delivered BEFORE the side\nstream begins; no further SetChargingProfileRequest\nis sent during the side stream sequence (Figure 139).
+        deactivate CSMS
+        deactivate CS
+
+        EV -> CS: DC_ChargeLoopReq(MeterInfoRequested: false, EVPresentVoltage,\nScheduled_DC_CLReqControlMode(EVTargetCurrent))
+        activate CS
+        CS --> EV: DC_ChargeLoopRes(EVSEStatus(NotificationMaxDelay,\nEVSENotification=ScheduleRenegotiation))
+        note right: Per [K16.FR.02] and [V2G20-1845]: SECC signals\nrenegotiation via EVSENotification=ScheduleRenegotiation\nin ChargeLoopRes on the mainstream channel.
+        deactivate CS
+
+        note over EV, CS: Main stream DC_ChargeLoopReq/Res continues\nuninterrupted during renegotiation
+    end
+
+    /' K17: Renegotiation initiated by EV '/
+    group Initiated by EV (OCPP K17)
+        note over EV, CS: EV decides to renegotiate, initiates on\nparallel side stream (ScheduleRenegotiationPayloadID)\nper [V2G20-1846]
+    end
+
+    /' Renegotiation sequence: shared opening (CPD, ScheduleExchangeReq), '/
+    /' then branches on trigger. Per [V2G20-1046, V2G20-1052] both paths '/
+    /' begin with ChargeParameterDiscoveryReq on the side stream. '/
+    /' K17 (Figure 141): SECC contacts CSMS via NotifyEVChargingNeeds and '/
+    /' waits for SetChargingProfileRequest. '/
+    /' K16 (Figure 139): no CSMS traffic on side stream; profile already delivered. '/
+    group Renegotiation Sequence (Side Stream)
+        /' CPD on side stream: single round-trip, no CSMS involvement '/
+        EV -> CS: DC_ChargeParameterDiscoveryReq(EVMaximumChargePower, EVMinimumChargePower,\nEVMaximumChargeCurrent, EVMinimumChargeCurrent,\nEVMaximumVoltage, EVMinimumVoltage)
+        activate CS
+        CS --> EV: DC_ChargeParameterDiscoveryRes(EVSEMaximumChargePower, EVSEMinimumChargePower,\nEVSEMaximumChargeCurrent, EVSEMinimumChargeCurrent,\nEVSEMaximumVoltage, EVSEMinimumVoltage)
+        deactivate CS
+
+        /' Per [V2G20-1048] EVCC sends ScheduleExchangeReq next on side stream '/
+        EV -> CS: ScheduleExchangeReq(MaximumSupportingPoints,\nScheduled_SEReqControlMode(DepartureTime, EVTargetEnergyRequest))
+        activate EV
+        activate CS
+
+        alt K17: EV-initiated (CSMS contacted on side stream, per Figure 141)
+            CS -> CSMS: NotifyEVChargingNeedsRequest(evseId,\nchargingNeeds(requestedEnergyTransfer: DC, controlMode: ScheduledControl,\nmobilityNeedsMode: EVCC,\nv2xChargingParameters(maxChargePower, minChargePower,\nmaxChargeCurrent, minChargeCurrent, maxVoltage, minVoltage,\nevTargetEnergyRequest),\ndepartureTime), maxScheduleTuples: 3)
+            note right: Per OCPP 2.1 [K17.FR.06]: a NotifyEVChargingNeedsRequest\nfor ISO 15118-20 SHALL contain V2XChargingParameters.\nDischarge fields are omitted in unidirectional DC.
+            activate CSMS
+            CSMS --> CS: NotifyEVChargingNeedsResponse(status = Accepted)
+            deactivate CSMS
+
+            loop Until EVSEProcessing = Finished (SECC awaits CSMS profile)
+                CS --> EV: ScheduleExchangeRes(EVSEProcessing=Ongoing)
+                deactivate CS
+                EV -> CS: ScheduleExchangeReq()
+                activate CS
+            end
+
+            /' SetChargingProfileRequest is the canonical loop-exit trigger per K17 Figure 141 '/
+            CSMS -> CS: SetChargingProfileRequest(evseId,\nchargingProfile(id, stackLevel, chargingProfilePurpose: TxProfile,\ntransactionId, chargingProfileKind: Absolute, chargingSchedule[]))
+            note right: Per OCPP 2.1 [K17.FR.07]: CSMS SHALL send a\nSetChargingProfileRequest with chargingProfilePurpose = TxProfile\nand at most three chargingSchedule elements. The transactionId\nbinds the profile to the active transaction.
+            activate CSMS
+            CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+            deactivate CSMS
+        else K16: CSMS-initiated (no CSMS traffic on side stream, per Figure 139)
+            note over CS, CSMS: Per OCPP 2.1 K16 Figure 139, the SECC does NOT send\nNotifyEVChargingNeedsRequest and the CSMS does NOT send\na new SetChargingProfileRequest on the side stream;\nthe profile was already delivered in the K16 trigger block above.\nScheduleExchangeRes returns directly without an Ongoing loop.
+        end
+
+        CS --> EV: ScheduleExchangeRes(EVSEProcessing=Finished,\nScheduled_SEResControlMode(ScheduleTuple[](\nChargingSchedule(PowerSchedule,\nPriceLevelSchedule(NumberOfPriceLevels, PriceLevelScheduleEntries))\n)))
+        note right: PriceLevelSchedule uses abstract levels (0=cheapest).\nAlternative: AbsolutePriceSchedule for exact currency prices.\nEV displays tariff to driver before accepting session.
+        deactivate CS
+        deactivate EV
+
+        EV -> CS: PowerDeliveryReq(EVProcessing: Finished,\nChargeProgress=ScheduleRenegotiation,\nEVPowerProfile(Scheduled_EVPPTControlMode(SelectedScheduleTupleID),\nEVPowerProfileEntries))
+        activate CS
+        CS --> EV: PowerDeliveryRes()
+        deactivate CS
+
+        CS -> CSMS: NotifyEVChargingScheduleRequest(evseId, chargingSchedule, timeBase, selectedChargingScheduleId)
+        activate CS
+        activate CSMS
+        CSMS --> CS: NotifyEVChargingScheduleResponse(status = Accepted)
+        deactivate CS
+        deactivate CSMS
+
+        note over EV, CS: New EVPowerProfile applied in next mainstream\nDC_ChargeLoopReq [V2G20-1050]
+    end
+end
+
+group End Charging and Stop OCPP Transaction
+    EV -> CS: PowerDeliveryReq(EVProcessing: Finished,\nChargeProgress: Stop,\nEVPowerProfile(Scheduled_EVPPTControlMode(SelectedScheduleTupleID),\nEVPowerProfileEntries))
+    note right: Per [V2G20-1546]: in all control modes EVPowerProfile,\nand in Scheduled Control Mode also ScheduleTupleID,\nshall be sent when ChargeProgress is Start, Standby,\nStop, or Pause. ScheduleTupleID is carried inside\nScheduled_EVPPTControlMode.SelectedScheduleTupleID.
+    activate CS
+    CS -> CS: Contactor Opened
+    CS --> EV: PowerDeliveryRes()
+    deactivate CS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = EVConnected, triggerReason = ChargingStateChanged)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+
+    EV -> CS: DC_WeldingDetectionReq(EVProcessing)
+    activate CS
+    note right: Implements welding detection per IEC 61851-23
+    CS --> EV: DC_WeldingDetectionRes(EVSEPresentVoltage)
+    deactivate CS
+
+    EV -> CS: SessionStopReq(ChargingSession: Terminate)
+    activate CS
+    CS --> EV: SessionStopRes()
+    deactivate CS
+
+    CS -> CSMS: StatusNotificationRequest(connectorStatus: Available)
+    activate CS
+    activate CSMS
+    CSMS --> CS: StatusNotificationResponse()
+    deactivate CS
+    deactivate CSMS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Ended, chargingState = Idle, triggerReason = EVDeparted, meterValue[](\nsampledValue[](measurand: Energy.Active.Import.Register, context: Transaction.End,\n  value: 50.0, unitOfMeasure(unit: kWh),\n  signedMeterValue(signedMeterData,\n    encodingMethod: OCMF, publicKey))))
+    note right: Final cumulative reading per OCPP 2.1\nSection J (configured via\nSampledDataCtrlr.TxEndedMeasurands).\nReplaces OCPP 1.6J StopTransaction.req\nmeterStop / transactionData.
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+end
+
+@enduml

@@ -1,0 +1,351 @@
+@startuml
+
+/' Config Variables to match OCPP Style '/
+skin rose
+skinparam shadowing false
+hide footbox
+
+/' Enable Teoz renderer for complex nesting '/
+!pragma teoz true
+
+/' ISO 15118-20 DC BPT + OCPP 2.1 (Dynamic Control Mode) '/
+/' Complete DC bidirectional power transfer session: session setup, service discovery, '/
+/' PnC auth, BPT charge parameter discovery, schedule exchange, DC safety phases, '/
+/' power delivery, charge loop (+200A), mid-session direction switch, discharge loop (-150A), '/
+/' V2G settlement, welding detection, session termination '/
+
+actor "EV driver" as EVD
+participant "ISO 15118-20 EV (EVCC)" as EV
+participant "EVSE (SECC)" as CS
+participant "OCPP 2.1 CSMS" as CSMS
+participant "Secondary Actor (SA)" as SA
+
+/' Explicit participant ordering ensures consistent left-to-right layout '/
+
+group ISO 15118-20 Initialization, Authentication, Authorization
+    note over CS, CSMS: All TransactionEventRequest messages carry mandatory\nseqNo, timestamp, and transactionInfo(transactionId)\nper OCPP 2.1 (TransactionEventRequest.json required fields).\nThese envelope fields are omitted here for clarity except\nwhere transactionId is contextually relevant, e.g., the\nperiodic meter value events in the charge/discharge loops.
+    SA -> CSMS: Provide Available PmaxSchedule or Tariff Table
+    EVD -> EV: Charging Cable Plugged In
+    activate CS
+    CS -> CSMS: StatusNotificationRequest(connectorStatus: Occupied)
+    activate CSMS
+    CSMS --> CS: StatusNotificationResponse()
+    deactivate CSMS
+    CS -> CSMS: TransactionEventRequest(eventType = Started, chargingState = EVConnected, triggerReason = CablePluggedIn,\nidToken(additionalInfo: [{additionalIdToken: <vehicleId>, type: "EVCCID"}]))
+    note right of CS: Q01.FR.02 SHALL: include EVCCID in idToken.additionalInfo\nfor ISO 15118-20 transactions. EVCCID is learned from\nSessionSetupReq below; in practice CS may delay this\nTransactionEventRequest until SessionSetup completes,\nor use a cached EVCCID for vehicles previously seen at\nthis charging station.
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CSMS
+    deactivate CS
+
+    /' Protocol negotiation and session setup '/
+    EV -> CS: SupportedAppProtocolReq()
+    activate CS
+    CS --> EV: SupportedAppProtocolRes()
+    deactivate CS
+
+    EV -> CS: SessionSetupReq()
+    activate CS
+    CS --> EV: SessionSetupRes()
+    deactivate CS
+
+    /' PnC certificate-based authentication inline '/
+    EV -> CS: AuthorizationSetupReq()
+    activate CS
+    CS --> EV: AuthorizationSetupRes(AuthorizationServices: [PnC],\nCertificateInstallationService: false,\nPnC_ASResAuthorizationMode(GenChallenge, SupportedProviders[opt][ProviderID*]))
+    deactivate CS
+
+    EV -> CS: AuthorizationReq(SelectedAuthorizationService: PnC,\nPnC_AReqAuthorizationMode(GenChallenge, ContractCertificateChain) [signed])
+    activate EV
+    activate CS
+    loop Until AuthorizeResponse received from CSMS (max 60s (V2G_EVCC_Ongoing_Timeout))
+        CS --> EV: AuthorizationRes(EVSEProcessing=Ongoing)
+        deactivate CS
+        EV -> CS: AuthorizationReq()
+        activate CS
+    end
+
+    note over CS: Extract eMAID from\nContractCertificate subject field
+    CS -> CSMS: AuthorizeRequest(idToken(type = eMAID), iso15118CertificateHashData)
+    activate CSMS
+    note over CSMS: Validate certificate chain via PKI\nOCSP revocation check: 5-60s latency
+    CSMS --> CS: AuthorizeResponse(idTokenInfo(status = Accepted),\nallowedEnergyTransfer: [DC_BPT, DC])
+    note right: allowedEnergyTransfer is a top-level (2.1)\nfield in AuthorizeResponse. Omitting it\ndefaults to charging only -- must be\npresent for CS to offer BPT services.
+    deactivate CSMS
+
+    CS --> EV: AuthorizationRes(EVSEProcessing=Finished, ResponseCode = OK)
+    deactivate CS
+    deactivate EV
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = EVConnected, triggerReason = Authorized)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+end
+
+group Service Discovery and Selection
+    /' DC BPT service selection '/
+    EV -> CS: ServiceDiscoveryReq()
+    activate CS
+    CS --> EV: ServiceDiscoveryRes(ServiceRenegotiationSupported: true,\nEnergyTransferServiceList: [DC, AC, DC_BPT, AC_BPT])
+    deactivate CS
+
+    EV -> CS: ServiceDetailReq(ServiceID: DC_BPT)
+    activate CS
+    CS --> EV: ServiceDetailRes(ServiceID: DC_BPT,\nServiceParameterList(ParameterSet(ParameterSetID: 1,\nConnector: Extended, ControlMode: Dynamic,\nMobilityNeedsMode: EVCC, Pricing: AbsolutePricing,\nBPTChannel: Unified, GeneratorMode: GridFollowing)))
+    note right: ServiceDetailRes parameters per\nISO 15118-20 Table 208 [V2G20-1360]:\nConnector, ControlMode, MobilityNeedsMode,\nPricing, BPTChannel, GeneratorMode.\nDepartureTime/TargetSOC/V2X energy bounds\nare carried in DC_ChargeParameterDiscoveryReq\nand ScheduleExchangeReq, NOT here.
+    deactivate CS
+
+    EV -> CS: ServiceSelectionReq(SelectedEnergyTransferService(\nServiceID: DC_BPT, ParameterSetID: 1), SelectedVASList[opt])
+    activate CS
+    CS --> EV: ServiceSelectionRes()
+    deactivate CS
+end
+
+group BPT Charge Parameter Discovery (Dynamic Mode)
+    EV -> CS: DC_ChargeParameterDiscoveryReq(\
+BPT_DC_CPDReqEnergyTransferMode(\nEVMaximumChargePower: +150000, EVMinimumChargePower: +1000,\nEVMaximumChargeCurrent: +400, EVMinimumChargeCurrent: +5,\nEVMaximumVoltage: 900, EVMinimumVoltage: 200,\nEVMaximumDischargePower: -100000, EVMinimumDischargePower: -1000,\nEVMaximumDischargeCurrent: -250, EVMinimumDischargeCurrent: -5))
+    note right: Per ISO 15118-20 [V2G20-1213]:\ndischarge parameters MUST use NEGATIVE values,\ncharge parameters MUST use POSITIVE values.\n(Applies to all DC BPT control mode messages.)
+    activate CS
+
+    CS --> EV: DC_ChargeParameterDiscoveryRes(\
+BPT_DC_CPDResEnergyTransferMode(\nEVSEMaximumChargePower: +150000, EVSEMinimumChargePower: +1000,\nEVSEMaximumChargeCurrent: +400, EVSEMinimumChargeCurrent: +5,\nEVSEMaximumVoltage: 900, EVSEMinimumVoltage: 200,\nEVSEMaximumDischargePower: -100000, EVSEMinimumDischargePower: -1000,\nEVSEMaximumDischargeCurrent: -250, EVSEMinimumDischargeCurrent: -5))
+    deactivate CS
+    note right: DC_ChargeParameterDiscoveryRes is a single round-trip per\nISO 15118-20 §8.3.4.5.2.3 / Table 59. The Res contains only\nHeader, ResponseCode, and BPT_DC_CPDResEnergyTransferMode;\nthere is NO EVSEProcessing field. The CSMS-side profile\ncomputation runs during the ScheduleExchange wait band per\nK19 Figure 143, not here.
+end
+
+group Schedule Exchange and CSMS Setpoint Negotiation (Dynamic Mode)
+    EV -> CS: ScheduleExchangeReq(MaximumSupportingPoints,\nDynamic_SEReqControlMode(DepartureTime, EVTargetEnergyRequest,\nEVMaximumEnergyRequest, EVMinimumEnergyRequest,\nEVMaximumV2XEnergyRequest, EVMinimumV2XEnergyRequest))
+    activate EV
+    activate CS
+    note right: Dynamic mode: EV provides operating\nenvelope, not a fixed schedule.\nV2X energy bounds for BPT negotiation.
+
+    note over CS: Per K19.FR.01, the ScheduleExchangeReq for Dynamic mode\nis the trigger for NotifyEVChargingNeedsRequest (NOT the\npreceding ChargeParameterDiscoveryReq, which is a pure\nEV/EVSE round-trip). Per Q01 Remarks (and Q01.FR.09\ndefault-mode rule), a strict implementation first requests\nrequested=DC (ChargingOnly) then renegotiates to DC_BPT\nafter CSMS confirms BPT in allowedEnergyTransfer.\nDiagram shows the post-renegotiation request (CSMS\nalready returned allowedEnergyTransfer: [DC_BPT, DC]\nin AuthorizeResponse).
+    CS -> CSMS: NotifyEVChargingNeedsRequest(evseId, chargingNeeds(\
+requestedEnergyTransfer: DC_BPT, availableEnergyTransfer: [DC_BPT, DC],\ncontrolMode: DynamicControl, mobilityNeedsMode: EVCC,\nv2xChargingParameters(\nevMaxV2XEnergyRequest: 50000, evMinV2XEnergyRequest: 10000), departureTime))
+    note over CS, CSMS: Per K19.FR.06 SHALL: NotifyEVChargingNeedsRequest\nfor an ISO 15118-20 transaction (BPT or unidirectional)\nMUST contain V2XChargingParametersType instead of\nACChargingParametersType or DCChargingParametersType.\nDCChargingParametersType is described in the OCPP 2.1\nschema as "EV DC charging parameters for ISO 15118-2"\nand is therefore omitted; v2xChargingParameters is the\nonly permitted carrier here.
+    activate CSMS
+    CSMS --> CS: NotifyEVChargingNeedsResponse(status = Accepted)
+    note right: CSMS may also return status=Processing\n(still computing profile; CS must wait)\nor status=NoChargingProfile if CSMS\nrelies on an existing TxDefaultProfile.
+    deactivate CSMS
+
+    note over CSMS: DynamicControl mode with BPT:\n- CSMS controls power direction in real-time\n- Positive setpoint = charge from grid\n- Negative setpoint = discharge to grid
+
+    loop Until SetChargingProfileRequest received from CSMS (max 60s per K19.FR.08, ScheduleExchangeReq timeout extended via Ongoing per Q01 NOTE)
+        CS --> EV: ScheduleExchangeRes(EVSEProcessing=Ongoing)
+        deactivate CS
+        EV -> CS: ScheduleExchangeReq()
+        activate CS
+    end
+
+    opt if Tariff is configured for EVSE
+        CSMS -> CS: SetDefaultTariffRequest(evseId, tariff)
+        activate CSMS
+        CS --> CSMS: SetDefaultTariffResponse(status = Accepted)
+        deactivate CSMS
+    end
+
+    CSMS -> CS: SetChargingProfileRequest(evseId, chargingProfile(\
+id: <profileId>, stackLevel: 0, transactionId: <transactionId>,\nchargingProfilePurpose: TxProfile, chargingProfileKind: Dynamic,\nchargingSchedule[](id: <scheduleId>, chargingRateUnit: W,\nchargingSchedulePeriod[](\
+startPeriod: 0, setpoint: 150000, operationMode: CentralSetpoint))))
+    activate CSMS
+    CS --> CSMS: SetChargingProfileResponse(status = Accepted)
+    deactivate CSMS
+    note over CSMS: Initial charging profile:\n+150kW (import from grid)\noperationMode: CentralSetpoint (bidirectional)\nper OCPP 2.1 section K. ChargingOnly is\nunidirectional and does not use setpoint.\nQ03.FR.02: limit and dischargeLimit MUST be\nomitted with CentralSetpoint; V2X.03/V2X.04\ncapping rules apply only to ExternalSetpoint.\nK19.FR.07 SHALL: transactionId is required\nwhenever chargingProfilePurpose = TxProfile\n(also per ChargingProfileType schema description).
+
+    CS --> EV: ScheduleExchangeRes(EVSEProcessing=Finished,\nDynamic_SEResControlMode(AbsolutePriceSchedule(\npriceScheduleID, currency, priceAlgorithm,\npriceRuleStacks(import rate, export rate))))
+    note right: AbsolutePriceSchedule preferred for BPT:\nnegative prices represent export earnings (EV to grid).\nPriceLevelSchedule is an alternative for simpler\nimplementations but cannot express bidirectional pricing.
+    deactivate CS
+    deactivate EV
+end
+
+group DC Safety Phases
+    /' Cable check '/
+    EV -> CS: DC_CableCheckReq()
+    activate EV
+    activate CS
+    note right: V2G_EVCC_DC_CableCheck_Timeout = 40s\n(some implementations extend for legacy equipment compatibility)
+    loop Until EVSEProcessing = Finished (insulation test)
+        CS --> EV: DC_CableCheckRes(EVSEProcessing=Ongoing)
+        deactivate CS
+        EV -> CS: DC_CableCheckReq()
+        activate CS
+    end
+    CS --> EV: DC_CableCheckRes(EVSEProcessing=Finished)
+    deactivate CS
+    deactivate EV
+
+    /' Pre-charge voltage matching '/
+    EV -> CS: DC_PreChargeReq(EVProcessing=Ongoing, EVPresentVoltage, EVTargetVoltage)
+    activate EV
+    activate CS
+    note right: V2G_EVCC_DC_PreCharge_Timeout = 10s\n(some implementations extend for high-power voltage ramp-up)
+    loop Until EV voltage matching complete
+        CS --> EV: DC_PreChargeRes(EVSEPresentVoltage)
+        deactivate CS
+        EV -> CS: DC_PreChargeReq(EVProcessing=Ongoing, EVPresentVoltage, EVTargetVoltage)
+        activate CS
+    end
+    CS --> EV: DC_PreChargeRes(EVSEPresentVoltage)
+    deactivate CS
+
+    EV -> CS: DC_PreChargeReq(EVProcessing=Finished, EVPresentVoltage, EVTargetVoltage)
+    activate CS
+    note right: [V2G20-1434] SHALL: once the precharge process is finished,\nthe EVCC sends DC_PreChargeReq with EVProcessing=Finished.\nThis transition gates the next allowed message (PowerDeliveryReq)\nper [V2G20-2006] / Table 217.
+    CS --> EV: DC_PreChargeRes(EVSEPresentVoltage)
+    deactivate CS
+    deactivate EV
+    note over EV, CS: EVSE adjusts output voltage to match EV battery voltage\nbefore contactor closure
+end
+
+group Charging Phase (Grid -> EV, +200A)
+    EV -> CS: PowerDeliveryReq(EVProcessing: Finished,\nChargeProgress: Start, EVPowerProfile)
+    activate CS
+    note right: EVProcessing is the mandatory first field of\nPowerDeliveryReqType (V2G_CI_CommonMessages.xsd).\nEVPowerProfile included per normative [V2G20-1546]\n(schema marks optional -- standard contradiction).\nBPT_ChannelSelection NOT sent here:\nper [V2G20-1065] it is required only when the\nBPT system needs HLC-based channel switching\n(BPTChannel = Separated). For BPTChannel = Unified\n(this diagram), it is optional and omitted.
+    CS -> CS: Contactor Closed
+    CS --> EV: PowerDeliveryRes()
+    deactivate CS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = Charging, triggerReason = ChargingStateChanged)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+
+    loop Every 250ms during charging
+        EV -> CS: DC_ChargeLoopReq(MeterInfoRequested: false, EVPresentVoltage: 400,\
+BPT_Dynamic_DC_CLReqControlMode(\nDepartureTime[opt], EVTargetEnergyRequest: 60000,\nEVMaximumEnergyRequest: 80000, EVMinimumEnergyRequest: 10000,\nEVMaximumChargePower: +80000, EVMinimumChargePower: +1000,\nEVMaximumChargeCurrent: +200,\nEVMaximumVoltage: 500, EVMinimumVoltage: 200,\nEVMaximumDischargePower: -60000, EVMinimumDischargePower: -1000,\nEVMaximumDischargeCurrent: -150,\nEVMaximumV2XEnergyRequest[opt]: 50000,\nEVMinimumV2XEnergyRequest[opt]: 10000))
+        activate EV
+        activate CS
+        CS --> EV: DC_ChargeLoopRes(\
+EVSEPresentCurrent: +200, EVSEPresentVoltage: 400,\nEVSEPowerLimitAchieved, EVSECurrentLimitAchieved, EVSEVoltageLimitAchieved,\nBPT_Dynamic_DC_CLResControlMode(\nEVSEMaximumChargePower: +150000, EVSEMinimumChargePower: +1000,\nEVSEMaximumChargeCurrent: +400, EVSEMaximumVoltage: 900,\nEVSEMaximumDischargePower: -100000, EVSEMinimumDischargePower: -1000,\nEVSEMaximumDischargeCurrent: -250, EVSEMinimumVoltage: 200))
+        deactivate CS
+        deactivate EV
+    end
+    note right: BPT_Dynamic_DC_CLReqControlMode mandatory fields\n(per ISO 15118-20 8.3.5.5.7.3 + XSD): both charge\nAND discharge limits sent every loop, regardless\nof current direction. Charge values positive,\ndischarge values negative per [V2G20-1213].\n+200A in EVSEPresentCurrent = charging (Grid -> EV)
+
+    EV -> CS: MeteringConfirmationReq(SignedMeteringData [signed])
+    activate EV
+    activate CS
+    CS --> EV: MeteringConfirmationRes()
+    deactivate CS
+    deactivate EV
+    note right: EVCC signs metered energy values\nfor non-repudiation (billing proof)
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, triggerReason = MeterValuePeriodic, transactionInfo(transactionId), meterValue[](\nsampledValue[](measurand: Energy.Active.Import.Register,\n  value: 25.3, unitOfMeasure(unit: kWh),\n  signedMeterValue(signedMeterData,\n    encodingMethod: OCMF, publicKey)),\nsampledValue[](measurand: Power.Active.Import,\n  value: 148500, unitOfMeasure(unit: W)),\nsampledValue[](measurand: Power.Active.Setpoint,\n  value: 150000, unitOfMeasure(unit: W)),\nsampledValue[](measurand: Power.Active.Residual,\n  value: -1500, unitOfMeasure(unit: W))))
+    activate CS
+    activate CSMS
+    note right of CS: V2X monitoring measurands (2.1):\nPower.Active.Setpoint = setpoint CS applied\nPower.Active.Residual = Import - Setpoint\n(tracks setpoint following accuracy)
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+end
+
+group Mid-Session Direction Switch and Discharging Phase (EV -> Grid, -150A)
+    note over CSMS: Grid peak detected:\nSwitch EV to V2G discharge mode
+
+    CSMS -> CS: UpdateDynamicScheduleRequest(chargingProfileId,\nscheduleUpdate(setpoint: -100000))
+    activate CSMS
+    CS --> CSMS: UpdateDynamicScheduleResponse(status = Accepted)
+    deactivate CSMS
+    note over CSMS: Discharge at -100kW (export to grid)\nNegative setpoint = discharge direction.\nUpdateDynamicScheduleRequest updates an existing\nDynamic profile in-flight -- no full profile resend needed.
+
+    note over CS, CSMS: OCPP 2.1 ChargingStateEnumType has no "Discharging" value.\nDirection change is implicit via negative setpoint.\nCSMS already knows -- it initiated the switch.
+
+    loop Every 250ms during discharging
+        EV -> CS: DC_ChargeLoopReq(MeterInfoRequested: false, EVPresentVoltage: 400,\
+BPT_Dynamic_DC_CLReqControlMode(\nDepartureTime[opt], EVTargetEnergyRequest: 60000,\nEVMaximumEnergyRequest: 80000, EVMinimumEnergyRequest: 10000,\nEVMaximumChargePower: +80000, EVMinimumChargePower: +1000,\nEVMaximumChargeCurrent: +200,\nEVMaximumVoltage: 500, EVMinimumVoltage: 200,\nEVMaximumDischargePower: -60000, EVMinimumDischargePower: -1000,\nEVMaximumDischargeCurrent: -150,\nEVMaximumV2XEnergyRequest[opt]: 50000,\nEVMinimumV2XEnergyRequest[opt]: 10000))
+        activate EV
+        activate CS
+        CS --> EV: DC_ChargeLoopRes(\
+EVSEPresentCurrent: -150, EVSEPresentVoltage: 400,\nEVSEPowerLimitAchieved, EVSECurrentLimitAchieved, EVSEVoltageLimitAchieved,\nBPT_Dynamic_DC_CLResControlMode(\nEVSEMaximumChargePower: +150000, EVSEMinimumChargePower: +1000,\nEVSEMaximumChargeCurrent: +400, EVSEMaximumVoltage: 900,\nEVSEMaximumDischargePower: -100000, EVSEMinimumDischargePower: -1000,\nEVSEMaximumDischargeCurrent: -250, EVSEMinimumVoltage: 200))
+        deactivate CS
+        deactivate EV
+    end
+    note right: Same field set as charging loop -- only the\nactual EVSEPresentCurrent sign changes (-150A = EV -> Grid).\nDischarge limits negative per [V2G20-1213].\nDirection is signalled by the OCPP setpoint sign\nand by EVSEPresentCurrent, NOT by which fields are sent.
+
+    EV -> CS: MeteringConfirmationReq(SignedMeteringData [signed])
+    activate EV
+    activate CS
+    CS --> EV: MeteringConfirmationRes()
+    deactivate CS
+    deactivate EV
+    note right: EVCC signs metered energy values\nfor non-repudiation (billing proof)
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, triggerReason = MeterValuePeriodic, transactionInfo(transactionId), meterValue[](\nsampledValue[](measurand: Energy.Active.Export.Register,\n  value: 8.7, unitOfMeasure(unit: kWh),\n  signedMeterValue(signedMeterData,\n    encodingMethod: OCMF, publicKey)),\nsampledValue[](measurand: Power.Active.Export,\n  value: 99200, unitOfMeasure(unit: W)),\nsampledValue[](measurand: Power.Active.Setpoint,\n  value: -100000, unitOfMeasure(unit: W)),\nsampledValue[](measurand: Power.Active.Residual,\n  value: -800, unitOfMeasure(unit: W))))
+    activate CS
+    activate CSMS
+    note right of CS: Discharge phase: Export ~99.2 kW while\nfollowing -100 kW setpoint. Residual per\nOCPP 2.1 = Export + Setpoint when Setpoint<0\n(= 99200 + (-100000) = -800).
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+
+    note over CSMS, CS: CSMS can switch direction at any time\nvia UpdateDynamicScheduleRequest (OCPP 2.1 Q04 push)
+end
+
+group End Charging, V2G Settlement, and Stop OCPP Transaction
+    EV -> CS: PowerDeliveryReq(EVProcessing: Finished,\nChargeProgress: Stop, EVPowerProfile)
+    activate CS
+    CS -> CS: Contactor Opened
+    CS --> EV: PowerDeliveryRes()
+    deactivate CS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Updated, chargingState = EVConnected, triggerReason = ChargingStateChanged)
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+
+    EV -> CS: DC_WeldingDetectionReq(EVProcessing=Ongoing)
+    activate EV
+    activate CS
+    note right: Implements welding detection per IEC 61851-23.\nEVCC polls per [V2G20-1573] while the welding check is\nin progress, then sends Finished per [V2G20-1461].\nThe Finished transition gates the next allowed\nmessage (SessionStopReq) per [V2G20-1631] / Table 217.
+    loop Until welding check complete
+        CS --> EV: DC_WeldingDetectionRes(EVSEPresentVoltage)
+        deactivate CS
+        EV -> CS: DC_WeldingDetectionReq(EVProcessing=Ongoing)
+        activate CS
+    end
+    CS --> EV: DC_WeldingDetectionRes(EVSEPresentVoltage)
+    deactivate CS
+
+    EV -> CS: DC_WeldingDetectionReq(EVProcessing=Finished)
+    activate CS
+    CS --> EV: DC_WeldingDetectionRes(EVSEPresentVoltage)
+    deactivate CS
+    deactivate EV
+
+    EV -> CS: SessionStopReq(ChargingSession: Terminate)
+    activate CS
+    CS --> EV: SessionStopRes()
+    deactivate CS
+
+    CS -> CSMS: StatusNotificationRequest(connectorStatus: Available)
+    activate CS
+    activate CSMS
+    CSMS --> CS: StatusNotificationResponse()
+    deactivate CS
+    deactivate CSMS
+
+    CS -> CSMS: TransactionEventRequest(eventType = Ended, chargingState = Idle, triggerReason = EVDeparted, meterValue[](\nsampledValue[](measurand: Energy.Active.Import.Register, context: Transaction.End,\n  value: 30.0, unitOfMeasure(unit: kWh),\n  signedMeterValue(signedMeterData,\n    encodingMethod: OCMF, publicKey)),\nsampledValue[](measurand: Energy.Active.Export.Register, context: Transaction.End,\n  value: 50.0, unitOfMeasure(unit: kWh),\n  signedMeterValue(signedMeterData,\n    encodingMethod: OCMF, publicKey))))
+    note right: Final cumulative readings per OCPP 2.1\nSection J (configured via\nSampledDataCtrlr.TxEndedMeasurands).\nReplaces OCPP 1.6J StopTransaction.req\nmeterStop / transactionData. BPT requires\nboth Import and Export registers for billing.\nValues here >= mid-loop snapshots above\n(25.3 kWh import / 8.7 kWh export were\nintra-session checkpoints, not totals).
+    activate CS
+    activate CSMS
+    CSMS --> CS: TransactionEventResponse()
+    deactivate CS
+    deactivate CSMS
+
+    CS -> CSMS: NotifySettlementRequest(transactionId, pspRef, status: Settled,\nsettlementAmount: -12.50, settlementTime)
+    activate CS
+    activate CSMS
+    CSMS --> CS: NotifySettlementResponse()
+    deactivate CS
+    deactivate CSMS
+    note over CSMS: Per OCPP 2.1 Figure 42, NotifySettlementRequest is sent\nAFTER TransactionEventRequest(eventType=Ended); transactionId\nties the post-transaction settlement to the now-closed transaction.\nNet V2G settlement: -$12.50 (credit to EV owner).\nDerivation from final meter values above:\n  Import: 30.0 kWh x $0.25/kWh = $7.50 cost\n  Export: 50.0 kWh x $0.40/kWh = $20.00 credit\n  Net: $7.50 - $20.00 = -$12.50
+end
+
+@enduml
